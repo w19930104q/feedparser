@@ -154,6 +154,7 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    normalize_json_feeds: bool | None = None,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +189,15 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param normalize_json_feeds:
+        Should feedparser normalize JSON feeds so that the parsed feed and
+        entry structure matches the RSS/Atom contract? When enabled,
+        ``content`` is always a list that retains both HTML and plain text
+        variants, ``tags`` is a list of dictionaries, attachments are exposed
+        through ``links``/``enclosures``, and feed-level authors and languages
+        are inherited by individual entries. Defaults to the value of
+        :data:`feedparser.NORMALIZE_JSON_FEEDS`, which is ``False`` so that
+        the historical JSON feed output remains unchanged.
 
     """
 
@@ -230,6 +240,7 @@ def parse(
             resolve_relative_uris=resolve_relative_uris,
             sanitize_html=sanitize_html,
             optimistic_encoding_detection=optimistic_encoding_detection,
+            normalize_json_feeds=normalize_json_feeds,
         )
     finally:
         if not hasattr(url_file_stream_or_string, "read"):
@@ -246,6 +257,7 @@ def _parse_file_inplace(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    normalize_json_feeds: bool | None = None,
 ) -> None:
     # Avoid a cyclic import.
     import feedparser
@@ -256,6 +268,8 @@ def _parse_file_inplace(
         resolve_relative_uris = bool(feedparser.RESOLVE_RELATIVE_URIS)
     if optimistic_encoding_detection is None:
         optimistic_encoding_detection = bool(feedparser.OPTIMISTIC_ENCODING_DETECTION)
+    if normalize_json_feeds is None:
+        normalize_json_feeds = bool(feedparser.NORMALIZE_JSON_FEEDS)
 
     stream_factory = convert_file_to_utf8(
         result["headers"], file, result, optimistic_encoding_detection
@@ -361,6 +375,9 @@ def _parse_file_inplace(
     if use_json_parser:
         result["version"] = None
         feed_parser = JSONParser(baseuri, baselang, "utf-8")
+        feed_parser.resolve_relative_uris = resolve_relative_uris
+        feed_parser.sanitize_html = sanitize_html
+        feed_parser.normalize = normalize_json_feeds
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:

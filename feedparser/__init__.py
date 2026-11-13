@@ -49,6 +49,12 @@ SANITIZE_HTML = 1
 # (uses less memory), set this to 1.
 OPTIMISTIC_ENCODING_DETECTION = 1
 
+# If you want feedparser to normalize JSON feeds so that their parsed structure
+# matches the RSS/Atom contract (``content`` as a list, ``tags`` as a list of
+# dicts, ``links``/``enclosures``, author inheritance, and so on), set this
+# to 1. The default is 0, which preserves the historical JSON feed output.
+NORMALIZE_JSON_FEEDS = 0
+
 
 __all__ = (
     "parse",
