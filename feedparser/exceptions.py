@@ -32,6 +32,7 @@ __all__ = [
     "CharacterEncodingUnknown",
     "NonXMLContentType",
     "UndeclaredNamespace",
+    "GeometryWarning",
 ]
 
 
@@ -52,4 +53,15 @@ class NonXMLContentType(FeedparserError):
 
 
 class UndeclaredNamespace(Exception):
+    pass
+
+
+class GeometryWarning(UserWarning):
+    """Emitted when a GeoRSS/GML geometry is rejected.
+
+    Rejected geometries are omitted from the ``geometries`` result but never
+    affect neighboring geometries or entries. The warning message identifies
+    the entry and the 1-based position of the geometry within that entry.
+    """
+
     pass

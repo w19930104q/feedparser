@@ -26,7 +26,35 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import math
+import warnings
+
+from ..exceptions import GeometryWarning
 from ..util import FeedParserDict
+
+# The coordinate reference systems accepted by the ``geometries`` result.
+# Only two-dimensional longitude/latitude CRSs are supported, so no
+# projection or datum conversion is ever performed.
+#
+# * EPSG:4326 -- coordinate tuples in the source document are ordered
+#   latitude first, longitude second, and are swapped on output.
+# * OGC CRS84 -- coordinate tuples are already ordered
+#   longitude first, latitude second, and are emitted unchanged.
+#
+# Both CRSs may be identified by their standard URN or HTTP identifiers.
+_EPSG_4326_URNS = {
+    "urn:ogc:def:crs:epsg::4326",
+    "urn:ogc:def:crs:epsg:6.6:4326",
+    "urn:ogc:def:crs:epsg:6.11:4326",
+    "urn:ogc:def:crs:epsg:6.18:4326",
+    "http://www.opengis.net/def/crs/epsg/0/4326",
+    "http://www.opengis.net/gml/srs/epsg.xml#4326",
+}
+_OGC_CRS84_URNS = {
+    "urn:ogc:def:crs:ogc::crs84",
+    "urn:ogc:def:crs:ogc:1.3:crs84",
+    "http://www.opengis.net/def/crs/ogc/1.3/crs84",
+}
 
 
 class Namespace:
@@ -38,7 +66,24 @@ class Namespace:
 
     def __init__(self):
         self.ingeometry = 0
+        # State for the opt-in ``geometries`` result. ``collect_geometries``
+        # is set by the API layer and defaults to a falsy value so that the
+        # legacy ``where`` behavior is completely unchanged unless requested.
+        self.collect_geometries = False
+        # A stack of in-progress geometry frames, independent of the legacy
+        # ``geometry``/``pos`` element stack so the two paths never interact.
+        self._geometry_frames = []
+        # Per-context geometry counters, keyed by the context dict itself so
+        # that feed-level and entry-level geometries are counted separately
+        # and counters never leak between entries.
+        self._geometry_counts = {}
         super().__init__()
+
+    # ------------------------------------------------------------------
+    # Legacy ``where`` handling. This path is preserved unchanged; the
+    # ``geometries`` collector below runs alongside it without sharing
+    # mutable state.
+    # ------------------------------------------------------------------
 
     def _start_georssgeom(self, attrs_d):
         self.push("geometry", 0)
@@ -55,20 +100,25 @@ class Namespace:
         context["where"].update(geometry)
 
     def _end_georss_point(self):
-        geometry = _parse_georss_point(self.pop("geometry"))
+        text = self.pop("geometry")
+        geometry = _parse_georss_point(text)
         if geometry:
             self._save_where(geometry)
+        self._collect_simple_geometry("Point", text)
 
     def _end_georss_line(self):
-        geometry = _parse_georss_line(self.pop("geometry"))
+        text = self.pop("geometry")
+        geometry = _parse_georss_line(text)
         if geometry:
             self._save_where(geometry)
+        self._collect_simple_geometry("LineString", text)
 
     def _end_georss_polygon(self):
-        this = self.pop("geometry")
-        geometry = _parse_georss_polygon(this)
+        text = self.pop("geometry")
+        geometry = _parse_georss_polygon(text)
         if geometry:
             self._save_where(geometry)
+        self._collect_simple_geometry("Polygon", text)
 
     def _end_georss_box(self):
         geometry = _parse_georss_box(self.pop("geometry"))
@@ -98,18 +148,25 @@ class Namespace:
         self._parse_srs_attrs(attrs_d)
         self.ingeometry = 1
         self.push("geometry", 0)
+        self._start_collected_gml_geometry("Point", attrs_d)
 
     def _start_gml_linestring(self, attrs_d):
         self._parse_srs_attrs(attrs_d)
         self.ingeometry = "linestring"
         self.push("geometry", 0)
+        self._start_collected_gml_geometry("LineString", attrs_d)
 
     def _start_gml_polygon(self, attrs_d):
         self._parse_srs_attrs(attrs_d)
         self.push("geometry", 0)
+        self._start_collected_gml_geometry("Polygon", attrs_d)
 
     def _start_gml_exterior(self, attrs_d):
         self.push("geometry", 0)
+        self._collect_start_ring("exterior")
+
+    def _start_gml_interior(self, attrs_d):
+        self._collect_start_ring("interior")
 
     def _start_gml_linearring(self, attrs_d):
         self.ingeometry = "polygon"
@@ -120,47 +177,257 @@ class Namespace:
 
     def _end_gml_pos(self):
         this = self.pop("pos")
-        context = self._get_context()
-        srs_name = context["where"].get("srsName")
-        srs_dimension = context["where"].get("srsDimension", 2)
-        swap = True
-        if srs_name and "EPSG" in srs_name:
-            epsg = int(srs_name.split(":")[-1])
-            swap = bool(epsg in _geogCS)
+        swap = self._legacy_swap()
+        srs_dimension = self._get_context()["where"].get("srsDimension", 2)
         geometry = _parse_georss_point(this, swap=swap, dims=srs_dimension)
         if geometry:
             self._save_where(geometry)
+        self._collect_gml_coordinate_text(this)
 
     def _start_gml_poslist(self, attrs_d):
         self.push("pos", 0)
 
     def _end_gml_poslist(self):
         this = self.pop("pos")
-        context = self._get_context()
-        srs_name = context["where"].get("srsName")
-        srs_dimension = context["where"].get("srsDimension", 2)
-        swap = True
-        if srs_name and "EPSG" in srs_name:
-            epsg = int(srs_name.split(":")[-1])
-            swap = bool(epsg in _geogCS)
+        swap = self._legacy_swap()
+        srs_dimension = self._get_context()["where"].get("srsDimension", 2)
         geometry = _parse_poslist(this, self.ingeometry, swap=swap, dims=srs_dimension)
         if geometry:
             self._save_where(geometry)
+        self._collect_gml_coordinate_text(this)
+
+    def _legacy_swap(self):
+        # Determine the legacy ``where`` axis order. Only bare ``EPSG:####``
+        # identifiers are understood historically; anything else (including
+        # URN/HTTP identifiers) defaults to latitude-first swapping.
+        srs_name = self._get_context()["where"].get("srsName")
+        if srs_name and "EPSG" in srs_name:
+            try:
+                epsg = int(srs_name.split(":")[-1])
+            except ValueError:
+                return True
+            return bool(epsg in _geogCS)
+        return True
 
     def _end_geom(self):
         self.ingeometry = 0
         self.pop("geometry")
 
-    _end_gml_point = _end_geom
-    _end_gml_linestring = _end_geom
-    _end_gml_linearring = _end_geom
-    _end_gml_exterior = _end_geom
-    _end_gml_polygon = _end_geom
+    def _end_gml_point(self):
+        self._end_geom()
+        self._collect_end_gml_geometry()
+
+    def _end_gml_linestring(self):
+        self._end_geom()
+        self._collect_end_gml_geometry()
+
+    def _end_gml_linearring(self):
+        self._end_geom()
+        self._collect_end_ring()
+
+    def _end_gml_exterior(self):
+        self._end_geom()
+
+    def _end_gml_interior(self):
+        self._collect_end_ring_container()
+
+    def _end_gml_polygon(self):
+        self._end_geom()
+        self._collect_end_gml_geometry()
 
     def _end_where(self):
         self.pop("where")
 
     _end_georss_where = _end_where
+
+    # ------------------------------------------------------------------
+    # Opt-in ``geometries`` collector.
+    #
+    # Every GeoRSS Simple and GML geometry encountered on a feed or entry
+    # is validated independently and, if valid, appended to that context's
+    # ``geometries`` list in document order. A rejected geometry is dropped
+    # (with a GeometryWarning identifying the entry and geometry index) and
+    # can never affect neighboring geometries or other entries.
+    # ------------------------------------------------------------------
+
+    def _start_item(self, attrs_d):
+        # Entries start with a fresh per-entry geometry counter. The base
+        # namespace implementation creates the entry context dict.
+        super()._start_item(attrs_d)
+        context = self._get_context()
+        self._geometry_counts.pop(context, None)
+        # Defensive: a malformed feed may leave geometry frames open when
+        # an entry closes early. Drop any stray frames so geometry state can
+        # never leak from one entry into the next one.
+        self._geometry_frames = []
+
+    _start_entry = _start_item
+
+    def _geometry_index(self, context):
+        index = self._geometry_counts.get(context, 0) + 1
+        self._geometry_counts[context] = index
+        return index
+
+    def _reject_geometry(self, frame, reason):
+        context = self._get_context()
+        index = frame["index"]
+        warnings.warn(
+            "Rejected GeoRSS geometry #{} on {}: {}".format(
+                index, self._geometry_context_label(context), reason
+            ),
+            GeometryWarning,
+            stacklevel=2,
+        )
+
+    def _geometry_context_label(self, context):
+        if self.inentry:
+            # Covers entry bodies as well as entry-level image, text input
+            # and source contexts, all of which belong to the current entry.
+            return "entry {}".format(len(self.entries) - 1)
+        return "the feed"
+
+    def _append_geometry(self, frame, geometry):
+        context = self._get_context()
+        context.setdefault("geometries", []).append(geometry)
+
+    # -- GeoRSS Simple geometries --------------------------------------
+
+    def _collect_simple_geometry(self, geom_type, text):
+        """Validate a GeoRSS Simple geometry for the geometries result.
+
+        The raw coordinate text is validated independently of the legacy
+        ``where`` parsers: the legacy parsers are intentionally permissive
+        (they accept 3D points, out of range values, unclosed rings, ...),
+        whereas the geometries result only accepts finite, in-range,
+        two-dimensional coordinates in closed polygon rings.
+        """
+        if not self.collect_geometries:
+            return
+        context = self._get_context()
+        frame = {"index": self._geometry_index(context), "type": geom_type}
+        # GeoRSS Simple coordinates are always WGS84 latitude first, so the
+        # values must be swapped into (longitude, latitude) order.
+        if geom_type == "Point":
+            parsed = _build_point(text, swap=True)
+        elif geom_type == "LineString":
+            parsed = _build_line(text, swap=True)
+        else:  # Polygon
+            ring = _parse_ring_text(text, None)
+            if ring is None:
+                parsed = None
+            else:
+                parsed = {"type": "Polygon", "coordinates": (ring,)}
+        if parsed is None:
+            self._reject_geometry(
+                frame, "invalid GeoRSS Simple {}".format(geom_type)
+            )
+            return
+        self._append_geometry(frame, parsed)
+
+    # -- GML geometries -------------------------------------------------
+
+    def _start_collected_gml_geometry(self, geom_type, attrs_d):
+        if not self.collect_geometries:
+            return
+        context = self._get_context()
+        # Resolve the srsName before pushing this geometry's frame, so an
+        # explicit attribute on the geometry cannot be shadowed by itself
+        # through ancestor inheritance.
+        srs_name = _resolve_srs_name(
+            attrs_d.get("srsname"),
+            self._inherited_srs_name(),
+        )
+        frame = {
+            "index": self._geometry_index(context),
+            "type": geom_type,
+            "srs_name": srs_name,
+            "rings": [],
+            "ring_role": None,
+            "has_coordinates": False,
+        }
+        self._geometry_frames.append(frame)
+
+    def _inherited_srs_name(self):
+        # GML allows an srsName on an enclosing geometry (or any ancestor)
+        # to be inherited by nested geometry elements.
+        for frame in reversed(self._geometry_frames[:-1]):
+            if frame["srs_name"] is not None:
+                return frame["srs_name"]
+        return None
+
+    def _collect_start_ring(self, role):
+        if not self.collect_geometries or not self._geometry_frames:
+            return
+        self._geometry_frames[-1]["ring_role"] = role
+
+    def _collect_end_ring_container(self):
+        if not self.collect_geometries or not self._geometry_frames:
+            return
+        # The interior/exterior element has closed; reset the active role
+        # so stray coordinate text cannot attach to the finished ring.
+        self._geometry_frames[-1]["ring_role"] = None
+
+    def _collect_gml_coordinate_text(self, text):
+        if not self.collect_geometries or not self._geometry_frames:
+            return
+        frame = self._geometry_frames[-1]
+        if frame["has_coordinates"]:
+            # A geometry carries exactly one coordinate encoding; ignore
+            # any additional pos/posList elements instead of merging them.
+            return
+        frame["has_coordinates"] = True
+        frame["raw_text"] = text
+
+    def _collect_end_ring(self):
+        if not self.collect_geometries or not self._geometry_frames:
+            return
+        frame = self._geometry_frames[-1]
+        if frame["type"] != "Polygon":
+            return
+        text = frame.pop("raw_text", "")
+        role = frame["ring_role"] or "exterior"
+        ring = _parse_ring_text(text, frame["srs_name"])
+        frame["rings"].append((role, ring))
+        frame["ring_role"] = None
+        frame["has_coordinates"] = False
+
+    def _collect_end_gml_geometry(self):
+        if not self.collect_geometries or not self._geometry_frames:
+            return
+        frame = self._geometry_frames.pop()
+        srs_name = frame["srs_name"]
+        axis = _crs_axis_order(srs_name)
+        if axis is None:
+            self._reject_geometry(
+                frame, "unknown or unsupported srsName {!r}".format(srs_name)
+            )
+            return
+        swap = axis == "latlon"
+        geom_type = frame["type"]
+
+        if geom_type == "Polygon":
+            geometry = self._build_collected_polygon(frame)
+        else:
+            text = frame.get("raw_text", "")
+            if geom_type == "Point":
+                geometry = _build_point(text, swap=swap)
+            else:  # LineString
+                geometry = _build_line(text, swap=swap)
+        if geometry is None:
+            self._reject_geometry(frame, "invalid GML {}".format(geom_type))
+            return
+        self._append_geometry(frame, geometry)
+
+    def _build_collected_polygon(self, frame):
+        rings = frame["rings"]
+        exterior = [ring for role, ring in rings if role == "exterior"]
+        if len(exterior) != 1 or exterior[0] is None:
+            return None
+        interiors = [ring for role, ring in rings if role == "interior"]
+        if any(ring is None for ring in interiors):
+            return None
+        coordinates = [exterior[0]] + interiors
+        return {"type": "Polygon", "coordinates": tuple(coordinates)}
 
 
 # GeoRSS geometry parsers. Each return a dict with 'type' and 'coordinates'
@@ -235,6 +502,115 @@ def _parse_georss_box(value, swap=True, dims=2):
         return {"type": "Box", "coordinates": tuple(coords)}
     except (IndexError, ValueError):
         return None
+
+
+# ----------------------------------------------------------------------
+# Strict validators used exclusively by the opt-in ``geometries`` result.
+#
+# Every output coordinate is a finite two-dimensional (longitude, latitude)
+# tuple of Python floats. No projection or datum conversion is performed:
+# EPSG:4326 input is latitude-first and gets swapped, OGC CRS84 input is
+# longitude-first and passes through unchanged. Any geometry that violates
+# these rules is rejected in full (the validator returns ``None``) so that
+# a single bad geometry can never contaminate another one.
+# ----------------------------------------------------------------------
+
+
+def _resolve_srs_name(srs_name, inherited):
+    """Resolve an element's srsName, applying GML inheritance.
+
+    A missing or blank attribute inherits the nearest ancestor srsName;
+    an explicitly present attribute (even if unknown) overrides it.
+    """
+    if srs_name is None or not str(srs_name).strip():
+        return inherited
+    return str(srs_name).strip()
+
+
+def _crs_axis_order(srs_name):
+    """Return ``'latlon'`` (EPSG:4326) or ``'lonlat'`` (OGC CRS84).
+
+    Returns ``None`` for unknown or unsupported coordinate reference
+    systems, including projected and three-dimensional CRSs.
+    """
+    if srs_name is None:
+        # GeoRSS Simple and GML without an srsName default to WGS84
+        # latitude/longitude, i.e. EPSG:4326 axis order.
+        return "latlon"
+    normalized = srs_name.strip().lower()
+    if normalized in _EPSG_4326_URNS or normalized == "epsg:4326":
+        return "latlon"
+    if normalized in _OGC_CRS84_URNS:
+        return "lonlat"
+    return None
+
+
+def _tokenize_coordinates(text):
+    """Split coordinate text into floats, rejecting non-finite tokens.
+
+    Returns a flat list of floats, or ``None`` if any token is missing,
+    non-numeric, or not a finite number.
+    """
+    try:
+        values = [float(token) for token in text.replace(",", " ").split()]
+    except (ValueError, TypeError):
+        return None
+    if any(not math.isfinite(value) for value in values):
+        return None
+    return values
+
+
+def _pair_up(values, swap):
+    """Group a flat coordinate list into (longitude, latitude) 2-tuples.
+
+    Rejects incomplete tuples (a trailing single value), non-finite values,
+    and out-of-range longitude/latitude components.
+    """
+    if values is None or len(values) < 2 or len(values) % 2:
+        return None
+    points = []
+    for i in range(0, len(values), 2):
+        first, second = values[i], values[i + 1]
+        if swap:
+            lon, lat = second, first
+        else:
+            lon, lat = first, second
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            return None
+        points.append((lon, lat))
+    return points
+
+
+def _build_point(text, swap):
+    points = _pair_up(_tokenize_coordinates(text), swap)
+    if points is None or len(points) != 1:
+        return None
+    return {"type": "Point", "coordinates": points[0]}
+
+
+def _build_line(text, swap):
+    points = _pair_up(_tokenize_coordinates(text), swap)
+    if points is None or len(points) < 2:
+        return None
+    return {"type": "LineString", "coordinates": tuple(points)}
+
+
+def _parse_ring_text(text, srs_name):
+    """Parse and validate one polygon ring's coordinate text."""
+    axis = _crs_axis_order(srs_name)
+    if axis is None:
+        return None
+    points = _pair_up(_tokenize_coordinates(text), swap=(axis == "latlon"))
+    if points is None or not _is_closed_ring(points):
+        return None
+    return tuple(points)
+
+
+def _is_closed_ring(points):
+    # A ring needs at least four positions (three distinct points plus a
+    # closing position identical to the first) and must be explicitly
+    # closed; open rings are rejected rather than closed implicitly.
+    return len(points) >= 4 and points[0] == points[-1]
 
 
 # The list of EPSG codes for geographic (latitude/longitude) coordinate

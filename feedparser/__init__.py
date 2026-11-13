@@ -31,6 +31,7 @@ from .exceptions import (
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
     FeedparserError,
+    GeometryWarning,
     NonXMLContentType,
     UndeclaredNamespace,
 )
@@ -49,6 +50,12 @@ SANITIZE_HTML = 1
 # (uses less memory), set this to 1.
 OPTIMISTIC_ENCODING_DETECTION = 1
 
+# If you want feedparser to collect every GeoRSS/GML geometry in a feed or
+# entry into a ``geometries`` list (instead of only exposing the last
+# geometry through ``where``), set this to 1. The feature is disabled by
+# default to preserve the historical ``where`` behavior.
+COLLECT_GEOMETRIES = 0
+
 
 __all__ = (
     "parse",
@@ -59,4 +66,5 @@ __all__ = (
     "CharacterEncodingUnknown",
     "NonXMLContentType",
     "UndeclaredNamespace",
+    "GeometryWarning",
 )

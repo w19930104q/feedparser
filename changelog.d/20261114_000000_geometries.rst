@@ -1,0 +1,28 @@
+Added
+-----
+
+*   Add an opt-in ``collect_geometries`` parameter to ``feedparser.parse()``
+    (and a matching ``feedparser.COLLECT_GEOMETRIES`` module variable,
+    disabled by default).
+
+    When enabled, every GeoRSS Simple and GML ``Point``, ``LineString`` and
+    ``Polygon`` geometry on a feed or entry is validated independently and
+    appended to a new ``geometries`` list in document order, instead of the
+    historical ``where`` result which only retains the last geometry of each
+    message. Polygons keep their exterior ring and all interior rings.
+
+    Geometries resolve their own ``srsName`` (with GML inheritance and
+    override), recognizing EPSG:4326 and OGC CRS84 via their standard URN and
+    HTTP identifiers. Output coordinates are always finite, in-range,
+    two-dimensional ``(longitude, latitude)`` float tuples; no projection
+    conversion is performed. Invalid geometries are rejected individually with
+    a new ``feedparser.GeometryWarning`` that identifies the entry and the
+    geometry index, and never affect neighboring geometries or entries.
+
+    The ``where`` result and all default behavior are unchanged.
+
+Fixed
+-----
+
+*   Fix a crash when a GML geometry used an HTTP-form ``srsName``
+    (such as ``http://www.opengis.net/def/crs/EPSG/0/4326``).
