@@ -174,6 +174,10 @@ class Namespace:
             self._save_author("name", value)
         elif self.incontributor:
             self._save_contributor("name", value)
+        elif self.inby:
+            # RFC 6721 tombstone ``by`` Person construct
+            if value:
+                self.bydata["name"] = value
         elif self.intextinput:
             context = self._get_context()
             context["name"] = value
@@ -216,6 +220,10 @@ class Namespace:
             self._save_author("href", value)
         elif self.incontributor:
             self._save_contributor("href", value)
+        elif self.inby:
+            # RFC 6721 tombstone ``by`` Person construct
+            if value:
+                self.bydata["href"] = value
 
     _end_homepage = _end_url
     _end_uri = _end_url
@@ -231,6 +239,10 @@ class Namespace:
             self._save_author("email", value)
         elif self.incontributor:
             self._save_contributor("email", value)
+        elif self.inby:
+            # RFC 6721 tombstone ``by`` Person construct
+            if value:
+                self.bydata["email"] = value
 
     def _start_subtitle(self, attrs_d):
         self.push_content("subtitle", attrs_d, "text/plain", 1)
@@ -357,6 +369,11 @@ class Namespace:
             attrs_d.setdefault("type", "application/atom+xml")
         else:
             attrs_d.setdefault("type", "text/html")
+        if self._inside_isolated_tombstone():
+            # A link inside an RFC 6721 tombstone that is not being captured
+            # (tombstone support disabled) must not touch feed/entry data.
+            self.push("link", 1)
+            return
         context = self._get_context()
         attrs_d = self._enforce_href(attrs_d)
         if "href" in attrs_d:
@@ -377,6 +394,9 @@ class Namespace:
             self.push("link", expecting_text)
 
     def _end_link(self):
+        if self._inside_isolated_tombstone():
+            self.pop("link")
+            return
         self.pop("link")
         self.isentrylink = 0
 
@@ -388,6 +408,9 @@ class Namespace:
 
     def _end_guid(self):
         value = self.pop("id")
+        if self._inside_isolated_tombstone():
+            # id inside a disabled tombstone; keep it out of feed/entry data
+            return
         self._save("guidislink", self.guidislink and "link" not in self._get_context())
         if self.guidislink:
             # guid acts as link, but only if 'ispermalink' is not present or is 'true',
@@ -400,7 +423,14 @@ class Namespace:
         if self.svgOK:
             return self.unknown_starttag("title", list(attrs_d.items()))
         self.push_content(
-            "title", attrs_d, "text/plain", self.infeed or self.inentry or self.insource
+            "title",
+            attrs_d,
+            "text/plain",
+            self.infeed
+            or self.inentry
+            or self.insource
+            or self.intombsource
+            or self.inby,
         )
 
     def _end_title(self):
@@ -491,11 +521,22 @@ class Namespace:
         if "url" in attrs_d:
             # This means that we're processing a source element from an RSS 2.0 feed
             self.sourcedata["href"] = attrs_d["url"]
+        if self.intombstone:
+            # RFC 6721 places the source element in the Atom namespace, so it
+            # arrives here without the tombstone prefix. Delegate to the
+            # dedicated handler so the source is nested under the tombstone.
+            # With tombstone support disabled the dedicated handler only
+            # tracks the element, keeping its contents out of the feed data.
+            return self._start_atomtomb_source(attrs_d)
         self.push("source", 1)
         self.insource = 1
         self.title_depth = -1
 
     def _end_source(self):
+        if self.intombstone:
+            # Isolated tombstone source; the data is captured by the dedicated
+            # tombstone handler when support is enabled and discarded otherwise.
+            return self._end_atomtomb_source()
         self.insource = 0
         value = self.pop("source")
         if value:

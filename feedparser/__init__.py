@@ -49,6 +49,11 @@ SANITIZE_HTML = 1
 # (uses less memory), set this to 1.
 OPTIMISTIC_ENCODING_DETECTION = 1
 
+# If you want feedparser to recognize RFC 6721 Atom tombstone
+# (deleted-entry) elements, set this to 1. It is disabled by default so
+# that parsing results remain unchanged unless explicitly opted in.
+ATOM_TOMBSTONES = 0
+
 
 __all__ = (
     "parse",

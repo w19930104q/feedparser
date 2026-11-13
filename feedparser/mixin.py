@@ -33,7 +33,7 @@ import re
 import xml.sax.saxutils
 
 from .html import _cp1252
-from .namespaces import _base, cc, dc, georss, itunes, mediarss, psc
+from .namespaces import _base, atomtombelem, cc, dc, georss, itunes, mediarss, psc
 from .sanitizer import HTMLSanitizer, sanitize_html
 from .urls import _urljoin, make_safe_absolute_uri, resolve_relative_uris
 from .util import FeedParserDict
@@ -53,6 +53,7 @@ class XMLParserMixin(
     itunes.Namespace,
     mediarss.Namespace,
     psc.Namespace,
+    atomtombelem.Namespace,
 ):
     namespaces = {
         "": "",
@@ -124,6 +125,8 @@ class XMLParserMixin(
         "http://www.w3.org/1999/xlink": "xlink",
         "http://www.w3.org/XML/1998/namespace": "xml",
         "http://podlove.org/simple-chapters": "psc",
+        # RFC 6721 Atom tombstone elements; only mapped when opted in.
+        atomtombelem.ATOM_TOMBSTONE_NAMESPACE: "atomtomb",
     }
     _matchnamespaces: dict[str, str] = {}
 
@@ -141,6 +144,7 @@ class XMLParserMixin(
     }
 
     can_contain_relative_uris = {
+        "comment",
         "content",
         "copyright",
         "description",
@@ -153,6 +157,7 @@ class XMLParserMixin(
     }
 
     can_contain_dangerous_markup = {
+        "comment",
         "content",
         "copyright",
         "description",
@@ -169,6 +174,29 @@ class XMLParserMixin(
         "text/html",
     }
 
+    # Atom source elements that may legitimately appear inside an RFC 6721
+    # tombstone's source element; anything else is treated as an unknown
+    # extension and discarded from the parsed output.
+    _atomtomb_source_known_elements = frozenset(
+        {
+            "id",
+            "title",
+            "link",
+            "subtitle",
+            "rights",
+            "updated",
+            "generator",
+            "icon",
+            "logo",
+            "author",
+            "name",
+            "email",
+            "href",
+            "contributor",
+            "category",
+        }
+    )
+
     def __init__(self):
         if not self._matchnamespaces:
             for k, v in self.namespaces.items():
@@ -179,6 +207,17 @@ class XMLParserMixin(
         self.namespaces_in_use = {}  # dictionary of namespaces defined by the feed
         self.resolve_relative_uris = False
         self.sanitize_html = False
+
+        # RFC 6721 Atom tombstone (deleted-entry) support is opt-in.
+        self.atom_tombstones = False
+        self.deleted_entries = []  # list of parsed tombstone dictionaries
+        self.tombstone_diagnostics = []  # quarantined invalid tombstones
+        self.intombstone = 0
+        self.tombstonedata = None
+        self.inby = 0
+        self.bydata = None
+        self.intombsource = 0
+        self.tombsourcedata = None
 
         # the following are used internally to track state;
         # this is really out of control and should be refactored
@@ -282,6 +321,15 @@ class XMLParserMixin(
             prefix, suffix = tag.split(":", 1)
         else:
             prefix, suffix = "", tag
+        # In a standalone tombstone document the tombstone namespace is the
+        # default namespace, so the loose SGML parser reports unprefixed
+        # tags. Recover the preferred prefix from the default-namespace
+        # mapping. The document root is always recovered; descendants are
+        # only recovered while inside a tombstone so that ordinary feeds
+        # that declare an unrelated default namespace are unaffected.
+        if not prefix and self.namespacemap.get(None) == "atomtomb":
+            if suffix in ("deleted-entry", "deleted_entry") or self.intombstone:
+                prefix = "atomtomb"
         prefix = self.namespacemap.get(prefix, prefix)
         if prefix:
             prefix = prefix + "_"
@@ -302,6 +350,32 @@ class XMLParserMixin(
             self.inimage = 0
 
         # call special handler (if defined) or default handler
+        # RFC 6721 element names contain hyphens, which are not legal in
+        # Python method names; dispatch them explicitly.
+        if suffix == "deleted-entry" or suffix == "deleted_entry":
+            if self.atom_tombstones and prefix == "atomtomb_":
+                return self._start_atomtomb_deleted_entry(attrs_d)
+            # Feature disabled (or an unrecognized prefixed element): keep
+            # the historical behavior without constructing an invalid method
+            # name containing a hyphen. Use a fixed name so the matching end
+            # tag can always pop it back off the stack and so descendants
+            # can detect they are inside a tombstone.
+            self.push("atomtomb_deleted_entry", 1)
+            return
+        if self.atom_tombstones and prefix == "atomtomb_":
+            # In a standalone tombstone document the Atom elements reused by
+            # RFC 6721 (the Person construct inside ``by`` and the Atom
+            # source children) are also in the tombstone default namespace,
+            # so they arrive with the atomtomb prefix. Redirect them to the
+            # shared Atom handlers so their semantics stay identical.
+            aliased = self._atomtomb_alias(suffix)
+            if aliased is not None:
+                return getattr(self, "_start_" + aliased)(attrs_d)
+            tombstone_handler = getattr(
+                self, "_start_atomtomb_" + suffix.replace("-", "_"), None
+            )
+            if tombstone_handler is not None:
+                return tombstone_handler(attrs_d)
         methodname = "_start_" + prefix + suffix
         try:
             method = getattr(self, methodname)
@@ -310,6 +384,17 @@ class XMLParserMixin(
             # Since there's no handler or something has gone wrong we
             # explicitly add the element and its attributes.
             unknown_tag = prefix + suffix
+            if self.intombstone or (
+                self.elementstack
+                and self.elementstack[0][0] == "atomtomb_deleted_entry"
+            ):
+                # RFC 6721 allows foreign markup inside a tombstone (both
+                # directly and inside its source element), but unknown
+                # extensions must not leak into the parsed result. The
+                # stack-based check also isolates foreign markup when
+                # tombstone support is disabled.
+                self.push(unknown_tag, 1)
+                return
             if len(attrs_d) == 0:
                 # No attributes so merge it into the enclosing dictionary
                 return self.push(unknown_tag, 1)
@@ -323,6 +408,11 @@ class XMLParserMixin(
             prefix, suffix = tag.split(":", 1)
         else:
             prefix, suffix = "", tag
+        # See unknown_starttag(): recover the preferred tombstone prefix for
+        # unprefixed elements in a standalone tombstone document.
+        if not prefix and self.namespacemap.get(None) == "atomtomb":
+            if suffix in ("deleted-entry", "deleted_entry") or self.intombstone:
+                prefix = "atomtomb"
         prefix = self.namespacemap.get(prefix, prefix)
         if prefix:
             prefix = prefix + "_"
@@ -330,6 +420,22 @@ class XMLParserMixin(
             self.svgOK -= 1
 
         # call special handler (if defined) or default handler
+        # RFC 6721 element names contain hyphens, which are not legal in
+        # Python method names; dispatch them explicitly.
+        if suffix == "deleted-entry" or suffix == "deleted_entry":
+            if self.atom_tombstones and prefix == "atomtomb_":
+                return self._end_atomtomb_deleted_entry()
+            self.pop("atomtomb_deleted_entry")
+            return
+        if self.atom_tombstones and prefix == "atomtomb_":
+            aliased = self._atomtomb_alias(suffix)
+            if aliased is not None:
+                return getattr(self, "_end_" + aliased)()
+            tombstone_handler = getattr(
+                self, "_end_atomtomb_" + suffix.replace("-", "_"), None
+            )
+            if tombstone_handler is not None:
+                return tombstone_handler()
         methodname = "_end_" + prefix + suffix
         try:
             if self.svgOK:
@@ -444,6 +550,14 @@ class XMLParserMixin(
 
     def track_namespace(self, prefix, uri):
         loweruri = uri.lower()
+        # The RFC 6721 tombstone namespace is only recognized when the
+        # caller explicitly opted in via atom_tombstones=True.
+        if (
+            not self.atom_tombstones
+            and loweruri == atomtombelem.ATOM_TOMBSTONE_NAMESPACE
+        ):
+            self.namespaces_in_use[prefix or ""] = uri
+            return
         if not self.version:
             if (prefix, loweruri) == (None, "http://my.netscape.com/rdf/simple/0.9/"):
                 self.version = "rss090"
@@ -607,8 +721,40 @@ class XMLParserMixin(
         if element == "title" and -1 < self.title_depth <= self.depth:
             return output
 
+        # Inside an RFC 6721 tombstone every recognized element (by, comment,
+        # link, source and its children) has a dedicated handler. Anything
+        # reaching this point is foreign markup that must be discarded
+        # rather than merged into the tombstone/feed dictionaries. The
+        # tombstone's own ``by`` Person construct and the known Atom
+        # children of its ``source`` element reuse the shared handlers and
+        # are stored normally; unknown extensions inside source are dropped.
+        # This also covers the tombstone tracking element itself and
+        # applies when tombstone support is disabled.
+        if element == "atomtomb_deleted_entry":
+            return output
+        if self.intombstone and not self.inby and not self.intombsource:
+            return output
+        if (
+            self.intombsource
+            and element
+            not in self._atomtomb_source_known_elements
+        ):
+            return output
+        if not self.intombstone and self.elementstack and (
+            self.elementstack[0][0] == "atomtomb_deleted_entry"
+        ):
+            return output
+
         # store output in appropriate place(s)
-        if self.inentry and not self.insource:
+        if self.inby or self.intombsource:
+            # RFC 6721 tombstone Person construct (``by``) or Atom source.
+            context = self._get_context()
+            context[element] = output
+            if self.incontent:
+                contentparams = copy.deepcopy(self.contentparams)
+                contentparams["value"] = output
+                context[element + "_detail"] = contentparams
+        elif self.inentry and not self.insource:
             if element == "content":
                 self.entries[-1].setdefault(element, [])
                 contentparams = copy.deepcopy(self.contentparams)
@@ -755,7 +901,13 @@ class XMLParserMixin(
             context.setdefault(key, value)
 
     def _get_context(self):
-        if self.insource:
+        if self.inby:
+            context = self.bydata
+        elif self.intombsource:
+            context = self.tombsourcedata
+        elif self.intombstone:
+            context = self.tombstonedata
+        elif self.insource:
             context = self.sourcedata
         elif self.inimage and "image" in self.feeddata:
             context = self.feeddata["image"]
@@ -766,6 +918,52 @@ class XMLParserMixin(
         else:
             context = self.feeddata
         return context
+
+    def _inside_isolated_tombstone(self):
+        """Return whether the current element is inside a tombstone whose
+        contents are not being captured.
+
+        With tombstone support enabled, recognized tombstone sub-elements
+        (``by``, ``comment``, ``link`` and the dedicated ``source``) have
+        their own context and are not isolated. With support disabled, the
+        whole ``deleted-entry`` is pushed as a tracking element, so any
+        descendant is detected via the element stack and isolated from the
+        regular feed/entry dictionaries.
+        """
+
+        return not self.intombstone and bool(
+            self.elementstack
+            and self.elementstack[0][0] == "atomtomb_deleted_entry"
+        )
+
+    def _atomtomb_alias(self, suffix):
+        """Map tombstone-namespaced Atom elements to their base handlers.
+
+        In a standalone tombstone document the Atom vocabulary reused by
+        RFC 6721 (the Person construct in ``by`` and the children of the
+        Atom ``source`` element) is declared in the tombstone default
+        namespace and therefore carries the ``atomtomb`` prefix. Return the
+        unprefixed handler suffix so the standard Atom logic runs.
+        """
+
+        if self.inby and suffix in ("name", "email", "uri", "url"):
+            return "url" if suffix == "uri" else suffix
+        if self.intombsource and suffix in (
+            "id",
+            "title",
+            "link",
+            "subtitle",
+            "rights",
+            "updated",
+            "generator",
+            "icon",
+            "logo",
+            "author",
+            "contributor",
+            "category",
+        ):
+            return suffix
+        return None
 
     def _save_author(self, key, value, prefix="author"):
         context = self._get_context()

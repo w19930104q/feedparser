@@ -154,6 +154,7 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    atom_tombstones: bool | None = None,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +189,14 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param atom_tombstones:
+        Should feedparser recognize RFC 6721 Atom tombstone
+        (``deleted-entry``) elements? When enabled, tombstones found inside an
+        Atom feed or in a standalone tombstone document are exposed in a
+        separate ``deleted_entries`` list and never affect regular
+        ``entries``. Defaults to the value of
+        :data:`feedparser.ATOM_TOMBSTONES`, which is ``False`` so output is
+        unchanged unless explicitly opted in.
 
     """
 
@@ -230,6 +239,7 @@ def parse(
             resolve_relative_uris=resolve_relative_uris,
             sanitize_html=sanitize_html,
             optimistic_encoding_detection=optimistic_encoding_detection,
+            atom_tombstones=atom_tombstones,
         )
     finally:
         if not hasattr(url_file_stream_or_string, "read"):
@@ -246,6 +256,7 @@ def _parse_file_inplace(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    atom_tombstones: bool | None = None,
 ) -> None:
     # Avoid a cyclic import.
     import feedparser
@@ -256,6 +267,8 @@ def _parse_file_inplace(
         resolve_relative_uris = bool(feedparser.RESOLVE_RELATIVE_URIS)
     if optimistic_encoding_detection is None:
         optimistic_encoding_detection = bool(feedparser.OPTIMISTIC_ENCODING_DETECTION)
+    if atom_tombstones is None:
+        atom_tombstones = bool(feedparser.ATOM_TOMBSTONES)
 
     stream_factory = convert_file_to_utf8(
         result["headers"], file, result, optimistic_encoding_detection
@@ -305,6 +318,7 @@ def _parse_file_inplace(
         feed_parser = StrictFeedParser(baseuri, baselang, "utf-8")
         feed_parser.resolve_relative_uris = resolve_relative_uris
         feed_parser.sanitize_html = sanitize_html
+        feed_parser.atom_tombstones = atom_tombstones
         saxparser = xml.sax.make_parser(PREFERRED_XML_PARSERS)
         saxparser.setFeature(xml.sax.handler.feature_namespaces, 1)
         try:
@@ -336,6 +350,7 @@ def _parse_file_inplace(
         feed_parser = LooseFeedParser(baseuri, baselang, "utf-8", entities)
         feed_parser.resolve_relative_uris = resolve_relative_uris
         feed_parser.sanitize_html = sanitize_html
+        feed_parser.atom_tombstones = atom_tombstones
 
         # If an encoding was detected, use it; otherwise, assume utf-8 and do your best.
         # Will raise io.UnsupportedOperation if the underlying file is not seekable.
@@ -354,8 +369,14 @@ def _parse_file_inplace(
         feed_parser.feed(data)
 
         # If parsing with the loose XML parser resulted in no information,
-        # flag that the JSON parser should be tried.
-        if not (feed_parser.entries or feed_parser.feeddata or feed_parser.version):
+        # flag that the JSON parser should be tried. A standalone tombstone
+        # document contains no feed/entry data but is still valid XML.
+        if not (
+            feed_parser.entries
+            or feed_parser.feeddata
+            or feed_parser.version
+            or (atom_tombstones and feed_parser.deleted_entries)
+        ):
             use_json_parser = True
 
     if use_json_parser:
@@ -374,3 +395,7 @@ def _parse_file_inplace(
         result["namespaces"] = {}
     else:
         result["namespaces"] = feed_parser.namespaces_in_use
+        if atom_tombstones:
+            # RFC 6721 tombstones are kept separate from regular entries.
+            result["deleted_entries"] = feed_parser.deleted_entries
+            result["tombstone_diagnostics"] = feed_parser.tombstone_diagnostics
