@@ -49,6 +49,10 @@ SANITIZE_HTML = 1
 # (uses less memory), set this to 1.
 OPTIMISTIC_ENCODING_DETECTION = 1
 
+# If you want feedparser to collect GeoRSS Simple and GML geometries into
+# ordered ``geometries`` lists on the feed and on each entry, set this to 1.
+GEOMETRIES = 0
+
 
 __all__ = (
     "parse",

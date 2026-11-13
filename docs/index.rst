@@ -23,6 +23,7 @@ implied warranties.  See :ref:`the documentation license <license>` for more det
     basic
     advanced
     http
+    geometries
     annotated-examples
     reference
 

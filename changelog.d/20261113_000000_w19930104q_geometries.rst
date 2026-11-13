@@ -1,0 +1,8 @@
+Added
+-----
+
+*   Add an opt-in ``geometries`` mode (``feedparser.parse(..., geometries=True)``
+    or ``feedparser.GEOMETRIES = 1``) that collects GeoRSS Simple and GML
+    geometries into ordered ``geometries`` lists on the feed and on each
+    entry, with invalid geometries reported in ``geometries_diagnostics``.
+    The existing ``where`` behavior is unchanged.

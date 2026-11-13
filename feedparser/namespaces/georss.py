@@ -26,7 +26,17 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import math
+
 from ..util import FeedParserDict
+
+# The only CRS identifier supported by the opt-in ``geometries`` mode,
+# besides an absent ``srsName`` (which means WGS 84). Compared in lowercase.
+_SUPPORTED_SRS_NAME = "urn:ogc:def:crs:epsg::4326"
+
+
+class _GeometryError(ValueError):
+    """Raised when a geometry cannot be built from the given coordinates."""
 
 
 class Namespace:
@@ -38,6 +48,13 @@ class Namespace:
 
     def __init__(self):
         self.ingeometry = 0
+        # State for the opt-in ``geometries`` mode. ``geometries`` is toggled
+        # by feedparser.parse(); the rest tracks GML element scoping and
+        # per-context geometry ordinals while parsing.
+        self.geometries = False
+        self.geometries_diagnostics = []
+        self._geom_ordinals = {}
+        self._geom_stack = []
         super().__init__()
 
     def _start_georssgeom(self, attrs_d):
@@ -55,20 +72,28 @@ class Namespace:
         context["where"].update(geometry)
 
     def _end_georss_point(self):
-        geometry = _parse_georss_point(self.pop("geometry"))
+        text = self.pop("geometry")
+        geometry = _parse_georss_point(text)
         if geometry:
             self._save_where(geometry)
+        if self.geometries:
+            self._collect_simple_geometry("point", text)
 
     def _end_georss_line(self):
-        geometry = _parse_georss_line(self.pop("geometry"))
+        text = self.pop("geometry")
+        geometry = _parse_georss_line(text)
         if geometry:
             self._save_where(geometry)
+        if self.geometries:
+            self._collect_simple_geometry("linestring", text)
 
     def _end_georss_polygon(self):
-        this = self.pop("geometry")
-        geometry = _parse_georss_polygon(this)
+        text = self.pop("geometry")
+        geometry = _parse_georss_polygon(text)
         if geometry:
             self._save_where(geometry)
+        if self.geometries:
+            self._collect_simple_geometry("polygon", text)
 
     def _end_georss_box(self):
         geometry = _parse_georss_box(self.pop("geometry"))
@@ -98,25 +123,48 @@ class Namespace:
         self._parse_srs_attrs(attrs_d)
         self.ingeometry = 1
         self.push("geometry", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("point", attrs_d))
 
     def _start_gml_linestring(self, attrs_d):
         self._parse_srs_attrs(attrs_d)
         self.ingeometry = "linestring"
         self.push("geometry", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("linestring", attrs_d))
 
     def _start_gml_polygon(self, attrs_d):
         self._parse_srs_attrs(attrs_d)
         self.push("geometry", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("polygon", attrs_d))
 
     def _start_gml_exterior(self, attrs_d):
         self.push("geometry", 0)
+        if self.geometries:
+            self._geom_stack.append({"kind": "exterior"})
+
+    def _start_gml_interior(self, attrs_d):
+        if not self.geometries:
+            # Replicate the historical fallback for elements without
+            # a handler so that nothing changes when the opt-in
+            # ``geometries`` mode is disabled.
+            if not attrs_d:
+                return self.push("gml_interior", 1)
+            self._get_context()["gml_interior"] = attrs_d
+            return
+        self._geom_stack.append({"kind": "interior"})
 
     def _start_gml_linearring(self, attrs_d):
         self.ingeometry = "polygon"
         self.push("geometry", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("linearring", attrs_d))
 
     def _start_gml_pos(self, attrs_d):
         self.push("pos", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("pos", attrs_d))
 
     def _end_gml_pos(self):
         this = self.pop("pos")
@@ -130,9 +178,13 @@ class Namespace:
         geometry = _parse_georss_point(this, swap=swap, dims=srs_dimension)
         if geometry:
             self._save_where(geometry)
+        if self.geometries:
+            self._gml_collect_positions(this)
 
     def _start_gml_poslist(self, attrs_d):
         self.push("pos", 0)
+        if self.geometries:
+            self._geom_stack.append(_new_gml_frame("poslist", attrs_d))
 
     def _end_gml_poslist(self):
         this = self.pop("pos")
@@ -146,21 +198,299 @@ class Namespace:
         geometry = _parse_poslist(this, self.ingeometry, swap=swap, dims=srs_dimension)
         if geometry:
             self._save_where(geometry)
+        if self.geometries:
+            self._gml_collect_positions(this)
 
     def _end_geom(self):
         self.ingeometry = 0
         self.pop("geometry")
 
-    _end_gml_point = _end_geom
-    _end_gml_linestring = _end_geom
-    _end_gml_linearring = _end_geom
-    _end_gml_exterior = _end_geom
-    _end_gml_polygon = _end_geom
+    def _end_gml_point(self):
+        self._end_geom()
+        if self.geometries:
+            self._gml_finish_positions_geometry("point")
+
+    def _end_gml_linestring(self):
+        self._end_geom()
+        if self.geometries:
+            self._gml_finish_positions_geometry("linestring")
+
+    def _end_gml_linearring(self):
+        self._end_geom()
+        if self.geometries:
+            self._gml_finish_linearring()
+
+    def _end_gml_exterior(self):
+        self._end_geom()
+        if (
+            self.geometries
+            and self._geom_stack
+            and self._geom_stack[-1]["kind"] == "exterior"
+        ):
+            self._geom_stack.pop()
+
+    def _end_gml_interior(self):
+        if not self.geometries:
+            # Replicate the historical fallback for elements without
+            # a handler; see _start_gml_interior().
+            self.pop("gml_interior")
+            return
+        if self._geom_stack and self._geom_stack[-1]["kind"] == "interior":
+            self._geom_stack.pop()
+
+    def _end_gml_polygon(self):
+        self._end_geom()
+        if not self.geometries:
+            return
+        if not self._geom_stack or self._geom_stack[-1]["kind"] != "polygon":
+            return
+        frame = self._geom_stack.pop()
+        error = frame["error"]
+        if error is None and frame["exterior"] is None:
+            error = "polygon has no exterior ring"
+        if error is not None:
+            self._diagnose_geometry(error)
+            return
+        self._emit_geometry(
+            {"type": "Polygon", "coordinates": [frame["exterior"], *frame["interiors"]]}
+        )
 
     def _end_where(self):
         self.pop("where")
 
     _end_georss_where = _end_where
+
+    # Everything below supports the opt-in ``geometries`` mode.
+
+    def _collect_simple_geometry(self, kind, text):
+        """Validate a GeoRSS Simple geometry and append it to the context."""
+
+        try:
+            positions = _parse_positions(text or "", None, 2)
+            if kind == "point":
+                geometry = _build_point(positions)
+            elif kind == "linestring":
+                geometry = _build_linestring(positions)
+            else:
+                geometry = {"type": "Polygon", "coordinates": [_build_ring(positions)]}
+        except _GeometryError as exc:
+            self._diagnose_geometry(str(exc))
+            return
+        self._emit_geometry(geometry)
+
+    def _gml_collect_positions(self, text):
+        """Parse a gml:pos/gml:posList body into the enclosing GML geometry."""
+
+        # The effective srsName/srsDimension are scoped: the nearest
+        # enclosing element that declares them wins, and the values never
+        # leak to sibling elements because each element's frame is popped
+        # when the element ends.
+        srs_name, srs_dimension = self._gml_effective_srs()
+        if self._geom_stack and self._geom_stack[-1]["kind"] in ("pos", "poslist"):
+            self._geom_stack.pop()
+        try:
+            dims = _resolve_dimension(srs_dimension)
+            positions = _parse_positions(text or "", srs_name, dims)
+        except _GeometryError as exc:
+            self._gml_fail(str(exc))
+            return
+        for frame in reversed(self._geom_stack):
+            if "positions" in frame:
+                frame["positions"].extend(positions)
+                return
+
+    def _gml_effective_srs(self):
+        srs_name = None
+        srs_dimension = None
+        for frame in reversed(self._geom_stack):
+            if srs_name is None and frame.get("srs_name") is not None:
+                srs_name = frame["srs_name"]
+            if srs_dimension is None and frame.get("srs_dimension") is not None:
+                srs_dimension = frame["srs_dimension"]
+        return srs_name, srs_dimension
+
+    def _gml_fail(self, message):
+        """Mark the innermost GML geometry being built as invalid."""
+
+        for frame in reversed(self._geom_stack):
+            if frame["kind"] in ("point", "linestring", "linearring", "polygon"):
+                if frame.get("error") is None:
+                    frame["error"] = message
+                return
+
+    def _gml_finish_positions_geometry(self, kind):
+        if not self._geom_stack or self._geom_stack[-1]["kind"] != kind:
+            return
+        frame = self._geom_stack.pop()
+        error = frame["error"]
+        if error is None:
+            try:
+                if kind == "point":
+                    geometry = _build_point(frame["positions"])
+                else:
+                    geometry = _build_linestring(frame["positions"])
+            except _GeometryError as exc:
+                error = str(exc)
+        if error is not None:
+            self._diagnose_geometry(error)
+            return
+        self._emit_geometry(geometry)
+
+    def _gml_finish_linearring(self):
+        if not self._geom_stack or self._geom_stack[-1]["kind"] != "linearring":
+            return
+        frame = self._geom_stack.pop()
+        error = frame["error"]
+        ring = None
+        if error is None:
+            try:
+                ring = _build_ring(frame["positions"])
+            except _GeometryError as exc:
+                error = str(exc)
+        # Find the enclosing polygon, if any, and whether this ring is
+        # its exterior ring or one of its interior rings.
+        polygon_frame = None
+        target = "exterior"
+        parent = self._geom_stack[-1] if self._geom_stack else None
+        if parent is not None and parent["kind"] in ("exterior", "interior"):
+            target = parent["kind"]
+            if len(self._geom_stack) >= 2 and self._geom_stack[-2]["kind"] == "polygon":
+                polygon_frame = self._geom_stack[-2]
+        elif parent is not None and parent["kind"] == "polygon":
+            # Leniently treat a LinearRing placed directly inside
+            # a Polygon as the exterior ring.
+            polygon_frame = parent
+        if polygon_frame is not None:
+            if error is not None:
+                if polygon_frame["error"] is None:
+                    polygon_frame["error"] = error
+            elif target == "exterior":
+                if polygon_frame["exterior"] is None:
+                    polygon_frame["exterior"] = ring
+                elif polygon_frame["error"] is None:
+                    polygon_frame["error"] = "polygon has multiple exterior rings"
+            else:
+                polygon_frame["interiors"].append(ring)
+            return
+        # A standalone LinearRing is exposed as a polygon with a single ring.
+        if error is not None:
+            self._diagnose_geometry(error)
+            return
+        self._emit_geometry({"type": "Polygon", "coordinates": [ring]})
+
+    def _emit_geometry(self, geometry):
+        context = self._get_context()
+        self._next_geometry_ordinal(context)
+        context.setdefault("geometries", []).append(geometry)
+
+    def _diagnose_geometry(self, message):
+        context = self._get_context()
+        ordinal = self._next_geometry_ordinal(context)
+        entry = len(self.entries) - 1 if self.inentry else None
+        self.geometries_diagnostics.append(
+            FeedParserDict(entry=entry, geometry=ordinal, message=message)
+        )
+
+    def _next_geometry_ordinal(self, context):
+        key = id(context)
+        ordinal = self._geom_ordinals.get(key, 0)
+        self._geom_ordinals[key] = ordinal + 1
+        return ordinal
+
+
+# Helpers for the opt-in ``geometries`` mode. Coordinates are emitted as
+# (longitude, latitude) or (longitude, latitude, altitude) tuples, matching
+# the GeoJSON ordering; GeoRSS and GML encode WGS 84 as (lat, lon[, alt]).
+
+
+def _new_gml_frame(kind, attrs_d):
+    frame = {
+        "kind": kind,
+        "error": None,
+        "srs_name": attrs_d.get("srsname"),
+        "srs_dimension": attrs_d.get("srsdimension"),
+    }
+    if kind in ("point", "linestring", "linearring"):
+        frame["positions"] = []
+    elif kind == "polygon":
+        frame["exterior"] = None
+        frame["interiors"] = []
+    return frame
+
+
+def _resolve_dimension(raw):
+    if raw is None:
+        return 2
+    try:
+        dims = int(raw)
+    except (TypeError, ValueError):
+        raise _GeometryError(f"invalid srsDimension {raw!r}")
+    if dims not in (2, 3):
+        raise _GeometryError(f"unsupported srsDimension {raw!r}")
+    return dims
+
+
+def _parse_positions(value, srs_name, dims):
+    # Parse whitespace- or comma-separated coordinates into a list of
+    # (lon, lat[, alt]) tuples. Only WGS 84 (an absent srsName) and
+    # urn:ogc:def:crs:EPSG::4326 are supported; both order coordinates
+    # as (lat, lon[, alt]), so the first two ordinates are swapped.
+    if srs_name is not None and srs_name.strip().lower() != _SUPPORTED_SRS_NAME:
+        raise _GeometryError(f"unsupported srsName {srs_name!r}")
+    tokens = value.replace(",", " ").split()
+    if not tokens:
+        raise _GeometryError("no coordinates found")
+    if len(tokens) % dims:
+        raise _GeometryError(
+            f"coordinate count {len(tokens)} is not a multiple of dimension {dims}"
+        )
+    values = []
+    for token in tokens:
+        try:
+            number = float(token)
+        except ValueError:
+            raise _GeometryError(f"invalid coordinate {token!r}")
+        if not math.isfinite(number):
+            raise _GeometryError(f"non-finite coordinate {token!r}")
+        values.append(number)
+    positions = []
+    for i in range(0, len(values), dims):
+        group = values[i : i + dims]
+        positions.append((group[1], group[0], *group[2:]))
+    return positions
+
+
+def _check_consistent_dimensions(positions):
+    if len({len(position) for position in positions}) > 1:
+        raise _GeometryError("positions have inconsistent dimensions")
+
+
+def _build_point(positions):
+    if len(positions) != 1:
+        raise _GeometryError(
+            f"point requires exactly 1 position, found {len(positions)}"
+        )
+    return {"type": "Point", "coordinates": positions[0]}
+
+
+def _build_linestring(positions):
+    if len(positions) < 2:
+        raise _GeometryError(
+            f"line requires at least 2 positions, found {len(positions)}"
+        )
+    _check_consistent_dimensions(positions)
+    return {"type": "LineString", "coordinates": positions}
+
+
+def _build_ring(positions):
+    if len(positions) < 4:
+        raise _GeometryError(
+            f"polygon ring requires at least 4 positions, found {len(positions)}"
+        )
+    _check_consistent_dimensions(positions)
+    if positions[0] != positions[-1]:
+        raise _GeometryError("polygon ring is not closed")
+    return positions
 
 
 # GeoRSS geometry parsers. Each return a dict with 'type' and 'coordinates'
