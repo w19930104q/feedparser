@@ -1,0 +1,24 @@
+Added
+-----
+
+*   Add an opt-in ``normalize_json`` option to ``feedparser.parse()``.
+
+    When enabled, JSON Feed 1 and 1.1 data is normalized into the same output
+    shape as the RSS and Atom parsers:
+
+    *   ``content`` is always a list with standard MIME ``type`` values,
+        retaining both the text and HTML body when an entry has both;
+    *   ``tags`` and enclosure ``links`` use the XML shapes, and the
+        ``category`` and ``enclosures`` aliases keep working;
+    *   ``authors`` is always a list and takes precedence over the legacy
+        singular ``author``; entries without an author inherit a deep copy of
+        the feed-level authors, while an explicitly empty list does not
+        inherit anything;
+    *   ``date_modified`` correctly populates ``updated`` and a UTC
+        ``updated_parsed`` value;
+    *   HTML content honors the parse's sanitization and relative-URI
+        resolution settings, using the feed's base URI; plain text content
+        and entry ids are not rewritten.
+
+    The option defaults to ``False`` so the historical JSON output and all XML
+    parsing behavior are unchanged.

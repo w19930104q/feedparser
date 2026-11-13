@@ -154,6 +154,7 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    normalize_json: bool = False,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +189,15 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param normalize_json:
+        Should feedparser normalize JSON Feed 1/1.1 data so that its output
+        shape matches the RSS/Atom output (for example, ``content`` becomes
+        a list, ``tags`` and enclosure ``links`` use the XML shapes, and
+        ``authors`` is always a list)? This is opt-in and defaults to
+        ``False``; when disabled the historical JSON output is preserved
+        exactly. Note that enabling this also makes HTML processing in JSON
+        feeds honor the ``resolve_relative_uris`` and ``sanitize_html``
+        settings of this parse.
 
     """
 
@@ -230,6 +240,7 @@ def parse(
             resolve_relative_uris=resolve_relative_uris,
             sanitize_html=sanitize_html,
             optimistic_encoding_detection=optimistic_encoding_detection,
+            normalize_json=normalize_json,
         )
     finally:
         if not hasattr(url_file_stream_or_string, "read"):
@@ -246,6 +257,7 @@ def _parse_file_inplace(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    normalize_json: bool = False,
 ) -> None:
     # Avoid a cyclic import.
     import feedparser
@@ -360,7 +372,14 @@ def _parse_file_inplace(
 
     if use_json_parser:
         result["version"] = None
-        feed_parser = JSONParser(baseuri, baselang, "utf-8")
+        feed_parser = JSONParser(
+            baseuri,
+            baselang,
+            "utf-8",
+            normalize_json=normalize_json,
+            resolve_relative_uris=resolve_relative_uris,
+            sanitize_html=sanitize_html,
+        )
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:

@@ -72,3 +72,10 @@ Accessing an :abbr:`RSS (Rich Site Summary)` feed as an Atom feed
 
     For more examples of how :program:`Universal Feed Parser` normalizes
     content from different formats, see :ref:`annotated`.
+
+.. note::
+
+    JSON feeds use a different, historical output shape by default. Pass
+    ``normalize_json=True`` to ``feedparser.parse()`` to normalize JSON
+    Feed 1/1.1 data into the same shapes documented above; see
+    :ref:`advanced.json_normalization` for the details.

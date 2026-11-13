@@ -7,6 +7,7 @@ Advanced Features
     date-parsing
     html-sanitization
     content-normalization
+    json-normalization
     namespace-handling
     resolving-relative-links
     version-detection
